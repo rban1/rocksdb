@@ -1492,6 +1492,69 @@ TEST_F(DBTest, MetaDataTest) {
   CheckLiveFilesMeta(live_file_meta, files_by_level);
 }
 
+TEST_F(DBTest, GetColumnFamilyMetaDataWithKeyRangeAndLevel) {
+  Options options = CurrentOptions();
+  options.create_if_missing = true;
+  options.disable_auto_compactions = true;
+  Reopen(options);
+
+  // Create some test data across multiple levels
+  for (int i = 0; i < 100; i++) {
+    ASSERT_OK(Put(Key(i), "value" + std::to_string(i)));
+    if (i % 20 == 19) {
+      ASSERT_OK(Flush());
+    }
+  }
+
+  // Force some data to L1
+  ASSERT_OK(dbfull()->TEST_CompactRange(0, nullptr, nullptr));
+
+  // Test getting metadata for all files
+  ColumnFamilyMetaData cf_meta_all;
+  db_->GetColumnFamilyMetaData(&cf_meta_all);
+  size_t total_files_all = 0;
+  for (const auto& level : cf_meta_all.levels) {
+    total_files_all += level.files.size();
+  }
+
+  // Test getting metadata with key range filtering
+  ColumnFamilyMetaData cf_meta_range;
+  db_->GetColumnFamilyMetaData(db_->DefaultColumnFamily(), Slice(Key(20)),
+                               Slice(Key(79)), &cf_meta_range);
+
+  // Range filtering should return fewer or equal files
+  size_t total_files_range = 0;
+  for (const auto& level : cf_meta_range.levels) {
+    total_files_range += level.files.size();
+  }
+  ASSERT_LE(total_files_range, total_files_all);
+
+  // Test getting metadata for specific level (0)
+  ColumnFamilyMetaData cf_meta_level0;
+  db_->GetColumnFamilyMetaData(db_->DefaultColumnFamily(), Slice(), Slice(),
+                               &cf_meta_level0, 0);
+
+  // Level 0 filtering should only return level 0 files
+  bool has_non_zero_level = false;
+  for (const auto& level : cf_meta_level0.levels) {
+    if (level.level != 0) {
+      has_non_zero_level = true;
+      break;
+    }
+  }
+  ASSERT_FALSE(has_non_zero_level);
+
+  // Test getting metadata for specific level (1)
+  ColumnFamilyMetaData cf_meta_level1;
+  db_->GetColumnFamilyMetaData(db_->DefaultColumnFamily(), Slice(), Slice(),
+                               &cf_meta_level1, 1);
+
+  // Level 1 filtering should only return level 1 files (if any exist)
+  for (const auto& level : cf_meta_level1.levels) {
+    ASSERT_EQ(level.level, 1);
+  }
+}
+
 TEST_F(DBTest, AllMetaDataTest) {
   Options options = CurrentOptions();
   options.create_if_missing = true;
@@ -3534,6 +3597,12 @@ class ModelDB : public DB {
 
   void GetColumnFamilyMetaData(ColumnFamilyHandle* /*column_family*/,
                                ColumnFamilyMetaData* /*metadata*/) override {}
+
+  void GetColumnFamilyMetaData(ColumnFamilyHandle* /*column_family*/,
+                               const Slice& /*start_key*/,
+                               const Slice& /*end_key*/,
+                               ColumnFamilyMetaData* /*metadata*/,
+                               int /*level*/ = -1) override {}
 
   Status GetDbIdentity(std::string& /*identity*/) const override {
     return Status::OK();

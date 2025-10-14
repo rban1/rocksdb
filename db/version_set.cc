@@ -1989,6 +1989,100 @@ void Version::GetColumnFamilyMetaData(ColumnFamilyMetaData* cf_meta) {
   }
 }
 
+void Version::GetColumnFamilyMetaData(const Slice& start_key,
+                                      const Slice& end_key,
+                                      ColumnFamilyMetaData* cf_meta,
+                                      int level) {
+  assert(cf_meta);
+  assert(cfd_);
+
+  cf_meta->name = cfd_->GetName();
+  cf_meta->size = 0;
+  cf_meta->file_count = 0;
+  cf_meta->levels.clear();
+
+  cf_meta->blob_file_size = 0;
+  cf_meta->blob_file_count = 0;
+  cf_meta->blob_files.clear();
+
+  const auto& ioptions = cfd_->ioptions();
+  auto* vstorage = storage_info();
+  const InternalKeyComparator* icmp = &cfd_->internal_comparator();
+
+  int start_level = 0;
+  int end_level = cfd_->NumberLevels() - 1;
+
+  if (level >= 0) {
+    start_level = level;
+    end_level = level;
+  }
+
+  for (int cur_level = start_level; cur_level <= end_level; cur_level++) {
+    uint64_t level_size = 0;
+    std::vector<SstFileMetaData> files;
+    for (const auto& file : vstorage->LevelFiles(cur_level)) {
+      // Check if the file overlaps with the specified key range
+      if (!start_key.empty() && icmp->user_comparator()->Compare(
+                                    file->largest.user_key(), start_key) < 0) {
+        continue;  // File is entirely before the start key
+      }
+      if (!end_key.empty() && icmp->user_comparator()->Compare(
+                                  file->smallest.user_key(), end_key) > 0) {
+        continue;  // File is entirely after the end key
+      }
+
+      uint32_t path_id = file->fd.GetPathId();
+      std::string file_path;
+      if (path_id < ioptions.cf_paths.size()) {
+        file_path = ioptions.cf_paths[path_id].path;
+      } else {
+        assert(!ioptions.cf_paths.empty());
+        file_path = ioptions.cf_paths.back().path;
+      }
+      const uint64_t file_number = file->fd.GetNumber();
+      files.emplace_back(
+          MakeTableFileName("", file_number), file_number, file_path,
+          file->fd.GetFileSize(), file->fd.smallest_seqno,
+          file->fd.largest_seqno, file->smallest.user_key().ToString(),
+          file->largest.user_key().ToString(),
+          file->stats.num_reads_sampled.load(std::memory_order_relaxed),
+          file->being_compacted, file->temperature,
+          file->oldest_blob_file_number, file->TryGetOldestAncesterTime(),
+          file->TryGetFileCreationTime(), file->epoch_number,
+          file->file_checksum, file->file_checksum_func_name);
+      files.back().num_entries = file->num_entries;
+      files.back().num_deletions = file->num_deletions;
+      files.back().smallest = file->smallest.Encode().ToString();
+      files.back().largest = file->largest.Encode().ToString();
+      level_size += file->fd.GetFileSize();
+    }
+    if (!files.empty()) {
+      cf_meta->levels.emplace_back(cur_level, level_size, std::move(files));
+      cf_meta->file_count += cf_meta->levels.back().files.size();
+      cf_meta->size += level_size;
+    }
+  }
+
+  // For filtered queries, include blob files only if level filtering is
+  // disabled or if we're looking at level 0 (where blob files are conceptually
+  // stored)
+  if (level < 0 || level == 0) {
+    for (const auto& meta : vstorage->GetBlobFiles()) {
+      assert(meta);
+
+      cf_meta->blob_files.emplace_back(
+          meta->GetBlobFileNumber(),
+          BlobFileName("", meta->GetBlobFileNumber()),
+          ioptions.cf_paths.front().path, meta->GetBlobFileSize(),
+          meta->GetTotalBlobCount(), meta->GetTotalBlobBytes(),
+          meta->GetGarbageBlobCount(), meta->GetGarbageBlobBytes(),
+          meta->GetChecksumMethod(), meta->GetChecksumValue());
+      ++cf_meta->blob_file_count;
+      cf_meta->blob_file_size += meta->GetBlobFileSize();
+    }
+  }
+}
+
 uint64_t Version::GetSstFilesSize() {
   uint64_t sst_files_size = 0;
   for (int level = 0; level < storage_info_.num_levels_; level++) {
