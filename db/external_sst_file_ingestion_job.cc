@@ -7,16 +7,22 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <map>
 #include <string>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "db/builder.h"
 #include "db/db_impl/db_impl.h"
+#include "db/range_del_aggregator.h"
+#include "db/table_cache.h"
 #include "db/version_edit.h"
 #include "file/file_util.h"
+#include "file/filename.h"
 #include "file/random_access_file_reader.h"
 #include "logging/logging.h"
+#include "memory/arena.h"
 #include "monitoring/statistics_impl.h"
 #include "options/options_helper.h"
 #include "table/merging_iterator.h"
@@ -152,6 +158,55 @@ void ExternalSstFileIngestionJob::ActivateAtomicReplaceRangeTombstone() {
   DivideInputFilesIntoBatches();
 }
 
+Status ExternalSstFileIngestionJob::RecordDeclaredLevels(
+    const std::vector<std::string>& external_files_paths) {
+  assert(lsm_edit_spec_.has_value());
+  const std::vector<int>& levels = lsm_edit_spec_->levels;
+  const size_t num_files = files_to_ingest_.size();
+  if (levels.size() != num_files) {
+    return Status::InvalidArgument(
+        "LSM edit declares " + std::to_string(levels.size()) + " levels for " +
+        std::to_string(num_files) + " files");
+  }
+  if (ucmp_->timestamp_size() > 0) {
+    return Status::NotSupported(
+        "LSM edit is not supported on a column family with user-defined "
+        "timestamps");
+  }
+
+  const int num_levels = cfd_->NumberLevels();
+  // Files sharing a level above L0 must be disjoint, which is the invariant
+  // that level maintains. Group by level so the check is per level rather than
+  // over all input files, which may legitimately overlap across levels.
+  std::map<int, autovector<const IngestedFileInfo*>> files_per_level;
+  for (size_t i = 0; i < num_files; i++) {
+    const int level = levels[i];
+    if (level < 0 || level >= num_levels) {
+      return Status::InvalidArgument(
+          "LSM edit declares level " + std::to_string(level) + " for file " +
+          external_files_paths[i] + ", outside [0, " +
+          std::to_string(num_levels) + ")");
+    }
+    files_to_ingest_[i].declared_level = level;
+    if (level > 0) {
+      files_per_level[level].push_back(&files_to_ingest_[i]);
+    }
+  }
+
+  for (auto& [level, files] : files_per_level) {
+    std::sort(files.begin(), files.end(), file_range_checker_);
+    for (size_t i = 0; i + 1 < files.size(); i++) {
+      if (file_range_checker_.Overlaps(*files[i], *files[i + 1],
+                                       /* known_sorted= */ true)) {
+        return Status::InvalidArgument(
+            "LSM edit declares level " + std::to_string(level) +
+            " for files whose key ranges overlap each other");
+      }
+    }
+  }
+  return Status::OK();
+}
+
 Status ExternalSstFileIngestionJob::Prepare(
     const std::vector<std::string>& external_files_paths,
     const std::vector<std::string>& files_checksums,
@@ -212,6 +267,13 @@ Status ExternalSstFileIngestionJob::Prepare(
   // are divided into batches below.
   files_overlap_ = ComputeFilesOverlap(files_to_ingest_);
 
+  if (lsm_edit_spec_.has_value()) {
+    status = RecordDeclaredLevels(external_files_paths);
+    if (!status.ok()) {
+      return status;
+    }
+  }
+
   if (atomic_replace_range.has_value()) {
     atomic_replace_range_.emplace();
 
@@ -238,7 +300,9 @@ Status ExternalSstFileIngestionJob::Prepare(
         if (!file_range_checker_.Contains(*atomic_replace_range_,
                                           files_to_ingest_[i])) {
           return Status::InvalidArgument(
-              "Atomic replace range does not contain all files");
+              lsm_edit_spec_.has_value()
+                  ? "LSM edit range does not contain all files"
+                  : "Atomic replace range does not contain all files");
         }
       }
     } else {
@@ -729,6 +793,7 @@ Status ExternalSstFileIngestionJob::Run() {
       assert(!atomic_replace_range_->smallest_internal_key.unset());
       assert(!atomic_replace_range_->largest_internal_key.unset());
       bool has_partial_overlap = false;
+      autovector<std::pair<int, const FileMetaData*>> straddling_files;
       for (int lvl = 0; lvl < cfd_->NumberLevels(); lvl++) {
         if (cfd_->RangeOverlapWithCompaction(
                 atomic_replace_range_->smallest_internal_key.user_key(),
@@ -746,9 +811,25 @@ Status ExternalSstFileIngestionJob::Run() {
               edit_.DeleteFile(lvl, file->fd.GetNumber());
             } else {
               has_partial_overlap = true;
+              straddling_files.emplace_back(lvl, file);
             }
           }
         }
+      }
+      if (has_partial_overlap && lsm_edit_spec_.has_value()) {
+        // A straddling file keeps the part of itself that lies outside the
+        // edit, so it cannot be deleted. Retaining it is only correct if it
+        // holds nothing inside the edit's range.
+        if (!lsm_edit_spec_->probe_straddling_files) {
+          return Status::InvalidArgument(
+              "LSM edit range partially overlaps an existing file and "
+              "probe_straddling_files is disabled");
+        }
+        status = ProbeStraddlingFiles(super_version, straddling_files);
+        if (!status.ok()) {
+          return status;
+        }
+        has_partial_overlap = false;
       }
       if (has_partial_overlap) {
         if (ingestion_options_.fail_if_not_bottommost_level &&
@@ -1656,8 +1737,13 @@ Status ExternalSstFileIngestionJob::AssignLevelAndSeqnoForIngestedFile(
     SequenceNumber last_seqno, IngestedFileInfo* file_to_ingest,
     SequenceNumber* assigned_seqno,
     std::optional<int> prev_batch_uppermost_level) {
-  Status status;
   *assigned_seqno = 0;
+  if (file_to_ingest->declared_level >= 0) {
+    // DB::ApplyLsmEdit(): the caller stated where this file goes, so validate
+    // that instead of searching for a level.
+    return UseDeclaredLevelForIngestedFile(file_to_ingest);
+  }
+  Status status;
   const size_t ts_sz = ucmp_->timestamp_size();
   assert(!prev_batch_uppermost_level.has_value() ||
          prev_batch_uppermost_level.value() < cfd_->NumberLevels());
@@ -1810,6 +1896,108 @@ Status ExternalSstFileIngestionJob::CheckLevelForIngestedBehindFile(
   }
 
   file_to_ingest->picked_level = last_lvl;
+  return Status::OK();
+}
+
+Status ExternalSstFileIngestionJob::ProbeStraddlingFiles(
+    SuperVersion* super_version,
+    const autovector<std::pair<int, const FileMetaData*>>& straddling_files) {
+  assert(lsm_edit_spec_.has_value());
+  assert(atomic_replace_range_.has_value());
+  assert(!atomic_replace_range_->unset());
+  assert(ucmp_->timestamp_size() == 0);
+
+  const Slice start = atomic_replace_range_->smallest_internal_key.user_key();
+  const Slice limit = atomic_replace_range_->largest_internal_key.user_key();
+  const InternalKeyComparator& icmp = cfd_->internal_comparator();
+  InternalKey seek_key;
+  seek_key.Set(start, kMaxSequenceNumber, kValueTypeForSeek);
+
+  // TODO: plumb Env::IOActivity, Env::IOPriority
+  ReadOptions ro;
+  ro.fill_cache = ingestion_options_.fill_cache;
+  ro.total_order_seek = true;
+
+  for (const auto& [level, file] : straddling_files) {
+    Arena arena;
+    ReadRangeDelAggregator range_del_agg(&icmp,
+                                         kMaxSequenceNumber /* upper_bound */);
+    ScopedArenaPtr<InternalIterator> iter(cfd_->table_cache()->NewIterator(
+        ro, env_options_, icmp, *file, &range_del_agg,
+        super_version->mutable_cf_options, /*table_reader_ptr=*/nullptr,
+        cfd_->internal_stats()->GetFileReadHist(level),
+        TableReaderCaller::kExternalSSTIngestion, &arena,
+        /*skip_filters=*/false, level, /*max_file_size_for_l0_meta_pin=*/0,
+        /*smallest_compaction_key=*/nullptr,
+        /*largest_compaction_key=*/nullptr, /*allow_unprepared_value=*/false));
+    iter->Seek(seek_key.Encode());
+    Status s = iter->status();
+    if (!s.ok()) {
+      return s;
+    }
+    bool in_range = false;
+    if (iter->Valid()) {
+      ParsedInternalKey parsed;
+      s = ParseInternalKey(iter->key(), &parsed,
+                           db_options_.allow_data_in_errors);
+      if (!s.ok()) {
+        return s;
+      }
+      in_range = ucmp_->Compare(parsed.user_key, limit) < 0;
+    }
+    // A range tombstone reaching into the edit's range would shadow the
+    // grafted data, which carries the sequence numbers it was written with.
+    if (!in_range) {
+      in_range = range_del_agg.IsRangeOverlapped(start, limit,
+                                                 /*end_exclusive=*/true);
+    }
+    if (in_range) {
+      return Status::InvalidArgument("LSM edit range is not empty: " +
+                                     MakeTableFileName(file->fd.GetNumber()) +
+                                     " at level " + std::to_string(level) +
+                                     " holds keys inside it");
+    }
+  }
+  return Status::OK();
+}
+
+bool ExternalSstFileIngestionJob::DeclaredFileFitsInLevel(
+    const IngestedFileInfo* file_to_ingest, int level) const {
+  if (level == 0) {
+    // Level 0 sorted runs are allowed to overlap.
+    return true;
+  }
+  const VersionEdit::DeletedFiles& deleted = edit_.GetDeletedFiles();
+  const Slice start(file_to_ingest->start_ukey);
+  const Slice limit(file_to_ingest->limit_ukey);
+  for (const FileMetaData* existing :
+       cfd_->current()->storage_info()->LevelFiles(level)) {
+    if (deleted.count({level, existing->fd.GetNumber()}) > 0) {
+      continue;
+    }
+    if (ucmp_->Compare(limit, existing->smallest.user_key()) >= 0 &&
+        ucmp_->Compare(start, existing->largest.user_key()) <= 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
+Status ExternalSstFileIngestionJob::UseDeclaredLevelForIngestedFile(
+    IngestedFileInfo* file_to_ingest) {
+  assert(lsm_edit_spec_.has_value());
+  const int level = file_to_ingest->declared_level;
+  assert(level >= 0 && level < cfd_->NumberLevels());
+
+  // Run() has already rejected the edit if its range overlaps a pending
+  // compaction, and every file being installed lies inside that range, so the
+  // only thing left to establish is that the level has room.
+  if (!DeclaredFileFitsInLevel(file_to_ingest, level)) {
+    return Status::InvalidArgument(
+        "LSM edit declares level " + std::to_string(level) +
+        " for a file whose key range overlaps a file that stays at that level");
+  }
+  file_to_ingest->picked_level = level;
   return Status::OK();
 }
 
